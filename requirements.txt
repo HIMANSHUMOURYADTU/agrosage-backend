@@ -12,3 +12,4 @@ langchain-google-genai
 typing-extensions
 gunicorn
 uvicorn[standard]
+python-multipart
