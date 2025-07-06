@@ -1,5 +1,6 @@
 import os
 import io
+import requests  # <-- ADDED for API calls
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -8,10 +9,7 @@ from datetime import datetime
 from PIL import Image
 from typing import List, Dict
 
-# --- IMPORTS FOR ALL AI FEATURES ---
-# Note: You may need to run `pip install torch transformers google-generativeai langchain-google-genai`
-import torch
-from transformers import BlipProcessor, BlipForConditionalGeneration
+# --- IMPORTS FOR AI FEATURES (Now much lighter!) ---
 import google.generativeai as genai
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -20,18 +18,26 @@ from langchain.schema.runnable import RunnableMap, RunnablePassthrough
 
 # --- LOAD ENVIRONMENT & CONFIGURE ---
 load_dotenv()
+
+# Google API Key for Gemini text and vision models
 API_KEY = os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
     raise ValueError("Google API Key not found. Please set it in the .env file.")
 genai.configure(api_key=API_KEY)
+
+# Hugging Face API Token for image captioning model
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+if not HF_API_TOKEN:
+    raise ValueError("Hugging Face API Token not found. Please set it in the .env file.")
+
 app = FastAPI(title="AgroSage API")
 
 # --- CORS MIDDLEWARE ---
-# Allows your React app (from any origin) to communicate with this backend.
 origins = ["*"]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- IN-MEMORY DATABASE & FACTORS ---
+# WARNING: This database is temporary and will be reset every time your app on Render restarts or "spins down".
 fake_db = {
     "plots": {"plot_a": {"name": "North Field", "crop": "Tomatoes", "logs": []}, "plot_b": {"name": "West Patch", "crop": "Corn", "logs": []}},
     "missions": [{"id": "m1", "title": "Start a Compost Pile", "reward": 20, "completed": False}, {"id": "m2", "title": "Apply Neem Oil", "reward": 30, "completed": False}, {"id": "m3", "title": "Install Drip Irrigation", "reward": 50, "completed": False}, {"id": "m4", "title": "Crop Rotation Plan", "reward": 25, "completed": True}],
@@ -46,25 +52,47 @@ EMISSION_FACTORS = {
 }
 
 # ==============================================================================
-# --- AI MODEL INITIALIZATION (Happens once on startup) ---
+# --- AI MODEL INITIALIZATION (Now Lightweight!) ---
 # ==============================================================================
-print("Loading all AI models... This may take a moment on the first run.")
+print("Initializing lightweight AI clients...")
+# These are just API clients, they don't load large models into memory.
 llm_chat = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=API_KEY)
 llm_vision_pest = genai.GenerativeModel('gemini-1.5-flash')
+
+# These are simple text-based templates for our chains.
 eco_prompt_chat = ChatPromptTemplate.from_messages([("system", "You are EcoBot, a helpful assistant for Indian sustainable farming. Provide concise, actionable advice."),("human", "{input}")])
-chatbot_chain = eco_prompt_chat | llm_chat | StrOutputParser()
-caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
 prompt_classify_waste = ChatPromptTemplate.from_template("Analyze: '{caption}'. Classify the waste type (Biodegradable, Recyclable, Electronic, etc). Respond with only the waste type.")
 prompt_bin = ChatPromptTemplate.from_template("Item: '{caption}'. Based on Indian norms (SWM Rules), what dustbin color? (Green, Blue, Red, Yellow, Black). Respond with only the color.")
 prompt_explain = ChatPromptTemplate.from_template("Explain in one simple line why '{caption}' goes into its designated bin.")
+
+# These chains are also lightweight and just orchestrate API calls.
+chatbot_chain = eco_prompt_chat | llm_chat | StrOutputParser()
 chain_classify_waste = prompt_classify_waste | llm_chat | StrOutputParser()
 chain_bin = prompt_bin | llm_chat | StrOutputParser()
 chain_explain = prompt_explain | llm_chat | StrOutputParser()
-print("All AI models loaded successfully.")
+print("All lightweight AI clients initialized successfully.")
+
+# ==============================================================================
+# --- HELPER FUNCTION FOR HUGGING FACE API ---
+# ==============================================================================
+def get_caption_from_huggingface(image_bytes: bytes) -> str:
+    """Sends an image to the Hugging Face Inference API and gets a caption."""
+    API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base"
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    response = requests.post(API_URL, headers=headers, data=image_bytes)
+    
+    # Handle API errors, including the common "model is loading" error
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=f"Hugging Face API Error: {response.text}")
+    
+    # The first time you call, the model might need to load, which can take ~20s.
+    # The API will return a 503 error with an estimated time. The app should just show this error.
+    
+    return response.json()[0]['generated_text']
 
 # ==============================================================================
 # --- PYDANTIC MODELS (Data Structure Definitions) ---
+# (No changes needed here)
 # ==============================================================================
 class ChatQuery(BaseModel): query: str
 class PlotLog(BaseModel): plot_id: str; soil_moisture: float; pest_sighting: str | None = None
@@ -81,6 +109,7 @@ class DashboardDataResponse(BaseModel):
 
 # ==============================================================================
 # --- AI RECOMMENDATION & ALERT ENGINE ---
+# (No changes needed here)
 # ==============================================================================
 def generate_recommendations_and_alerts():
     recommendations, alerts = [], []
@@ -136,19 +165,24 @@ async def calculate_carbon_footprint(inputs: CarbonCalculatorInput):
     
     return CarbonCalculationResult(totalEmissions=total_emissions, categoryEmissions=category_emissions, recommendations=recommendations)
 
+# --- MODIFIED ENDPOINT ---
 @app.post("/classify-waste", response_model=WasteClassificationResponse)
 async def classify_waste(file: UploadFile = File(...)):
-    """Takes an image, generates a caption, and classifies the waste."""
+    """Takes an image, gets a caption from Hugging Face, and classifies the waste."""
     try:
-        image = Image.open(io.BytesIO(await file.read())).convert("RGB")
-        inputs = caption_processor(image, return_tensors="pt")
-        out = caption_model.generate(**inputs, max_new_tokens=50)
-        caption = caption_processor.decode(out[0], skip_special_tokens=True).strip()
+        image_bytes = await file.read()
+        caption = get_caption_from_huggingface(image_bytes)
+
+        # The rest of the chain works as before, now using the caption from the API
         category = chain_classify_waste.invoke({"caption": caption}).strip()
         bin_color = chain_bin.invoke({"caption": caption}).strip()
         explanation = chain_explain.invoke({"caption": caption}).strip()
         return WasteClassificationResponse(caption=caption, category=category, bin_color=bin_color, explanation=explanation)
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        # This will now also catch errors from the Hugging Face API call
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/scan-pest")
 async def scan_pest(file: UploadFile = File(...)):
@@ -191,12 +225,7 @@ async def log_plot_data(log: PlotLog):
     fake_db["plots"][log.plot_id]["logs"].append(timestamped_log)
     return {"message": "Log received successfully."}
 
+# The uvicorn runner is for local development only. Render will use its own command.
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
-# To run this app:
-# 1. Save it as main.py
-# 2. Create a .env file with your GOOGLE_API_KEY
-# 3. Run in terminal: uvicorn main:app --reload
