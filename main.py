@@ -1,7 +1,7 @@
 import os
 import io
-import requests  # <-- ADDED for API calls
-from fastapi import FastAPI, HTTPException, UploadFile, File
+# 'requests' is no longer needed
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -9,35 +9,27 @@ from datetime import datetime
 from PIL import Image
 from typing import List, Dict
 
-# --- IMPORTS FOR AI FEATURES (Now much lighter!) ---
+# --- IMPORTS FOR AI FEATURES ---
 import google.generativeai as genai
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.schema.runnable import RunnableMap, RunnablePassthrough
 
 # --- LOAD ENVIRONMENT & CONFIGURE ---
 load_dotenv()
 
-# Google API Key for Gemini text and vision models
+# Google API Key is the only AI-related key needed now
 API_KEY = os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
     raise ValueError("Google API Key not found. Please set it in the .env file.")
 genai.configure(api_key=API_KEY)
 
-# Hugging Face API Token for image captioning model
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
-if not HF_API_TOKEN:
-    raise ValueError("Hugging Face API Token not found. Please set it in the .env file.")
-
 app = FastAPI(title="AgroSage API")
 
 # --- CORS MIDDLEWARE ---
-origins = ["*"]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# --- IN-MEMORY DATABASE & FACTORS ---
-# WARNING: This database is temporary and will be reset every time your app on Render restarts or "spins down".
+# --- IN-MEMORY DATABASE & FACTORS (Example Data) ---
 fake_db = {
     "plots": {"plot_a": {"name": "North Field", "crop": "Tomatoes", "logs": []}, "plot_b": {"name": "West Patch", "crop": "Corn", "logs": []}},
     "missions": [{"id": "m1", "title": "Start a Compost Pile", "reward": 20, "completed": False}, {"id": "m2", "title": "Apply Neem Oil", "reward": 30, "completed": False}, {"id": "m3", "title": "Install Drip Irrigation", "reward": 50, "completed": False}, {"id": "m4", "title": "Crop Rotation Plan", "reward": 25, "completed": True}],
@@ -52,47 +44,51 @@ EMISSION_FACTORS = {
 }
 
 # ==============================================================================
-# --- AI MODEL INITIALIZATION (Now Lightweight!) ---
+# --- AI MODEL INITIALIZATION ---
 # ==============================================================================
-print("Initializing lightweight AI clients...")
-# These are just API clients, they don't load large models into memory.
+print("Initializing Google Gemini AI clients...")
 llm_chat = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=API_KEY)
 llm_vision_pest = genai.GenerativeModel('gemini-1.5-flash')
 
-# These are simple text-based templates for our chains.
+# --- PROMPT ENGINEERING FIXES ---
 eco_prompt_chat = ChatPromptTemplate.from_messages([("system", "You are EcoBot, a helpful assistant for Indian sustainable farming. Provide concise, actionable advice."),("human", "{input}")])
 prompt_classify_waste = ChatPromptTemplate.from_template("Analyze: '{caption}'. Classify the waste type (Biodegradable, Recyclable, Electronic, etc). Respond with only the waste type.")
 prompt_bin = ChatPromptTemplate.from_template("Item: '{caption}'. Based on Indian norms (SWM Rules), what dustbin color? (Green, Blue, Red, Yellow, Black). Respond with only the color.")
-prompt_explain = ChatPromptTemplate.from_template("Explain in one simple line why '{caption}' goes into its designated bin.")
+# This improved prompt provides more context for a better explanation
+prompt_explain = ChatPromptTemplate.from_template(
+    "In one simple sentence, explain why a '{item}' is considered '{category}' and goes into the {bin_color} bin in India."
+)
 
-# These chains are also lightweight and just orchestrate API calls.
 chatbot_chain = eco_prompt_chat | llm_chat | StrOutputParser()
 chain_classify_waste = prompt_classify_waste | llm_chat | StrOutputParser()
 chain_bin = prompt_bin | llm_chat | StrOutputParser()
 chain_explain = prompt_explain | llm_chat | StrOutputParser()
-print("All lightweight AI clients initialized successfully.")
+print("All AI clients initialized successfully.")
 
 # ==============================================================================
-# --- HELPER FUNCTION FOR HUGGING FACE API ---
+# --- HELPER FUNCTION FOR GEMINI CAPTIONING ---
 # ==============================================================================
-def get_caption_from_huggingface(image_bytes: bytes) -> str:
-    """Sends an image to the Hugging Face Inference API and gets a caption."""
-    API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base"
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-    response = requests.post(API_URL, headers=headers, data=image_bytes)
-    
-    # Handle API errors, including the common "model is loading" error
-    if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail=f"Hugging Face API Error: {response.text}")
-    
-    # The first time you call, the model might need to load, which can take ~20s.
-    # The API will return a 503 error with an estimated time. The app should just show this error.
-    
-    return response.json()[0]['generated_text']
+async def get_caption_from_gemini(image_bytes: bytes) -> str:
+    """Sends an image to the Google Gemini API and gets a direct caption."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        
+        # This more restrictive prompt prevents conversational fluff in the response
+        prompt = (
+            "Identify the main object in this image. Respond with only a short phrase describing the object, "
+            "like 'a plastic water bottle' or 'a crumpled aluminum can'. "
+            "Do not add any extra text, commentary, or options."
+        )
+        
+        response = await llm_vision_pest.generate_content_async([prompt, img])
+        return response.text.strip()
+        
+    except Exception as e:
+        print(f"ERROR from Google Gemini API: {e}")
+        raise HTTPException(status_code=500, detail=f"Google Gemini API Error: {str(e)}")
 
 # ==============================================================================
-# --- PYDANTIC MODELS (Data Structure Definitions) ---
-# (No changes needed here)
+# --- PYDANTIC MODELS ---
 # ==============================================================================
 class ChatQuery(BaseModel): query: str
 class PlotLog(BaseModel): plot_id: str; soil_moisture: float; pest_sighting: str | None = None
@@ -109,7 +105,6 @@ class DashboardDataResponse(BaseModel):
 
 # ==============================================================================
 # --- AI RECOMMENDATION & ALERT ENGINE ---
-# (No changes needed here)
 # ==============================================================================
 def generate_recommendations_and_alerts():
     recommendations, alerts = [], []
@@ -130,7 +125,6 @@ def read_root(): return {"message": "AgroSage Super-App API is Live"}
 
 @app.get("/dashboard-data", response_model=DashboardDataResponse)
 def get_dashboard_data():
-    """Fetches all necessary data for the main dashboard, including proactive alerts."""
     generated_data = generate_recommendations_and_alerts()
     active_missions_count = len([m for m in fake_db["missions"] if not m["completed"]])
     total_credits = sum(entry['credits'] for entry in fake_db['carbon_ledger'])
@@ -141,7 +135,6 @@ def get_dashboard_data():
 
 @app.post("/calculate-carbon", response_model=CarbonCalculationResult)
 async def calculate_carbon_footprint(inputs: CarbonCalculatorInput):
-    """Calculates the farm's carbon footprint based on user inputs."""
     category_emissions = {
         "Machinery": inputs.tractor_hours * EMISSION_FACTORS["tractor_diesel_per_hour"],
         "Fertilizers": inputs.fertilizer_kg * EMISSION_FACTORS["fertilizer_urea_per_kg"]
@@ -165,23 +158,30 @@ async def calculate_carbon_footprint(inputs: CarbonCalculatorInput):
     
     return CarbonCalculationResult(totalEmissions=total_emissions, categoryEmissions=category_emissions, recommendations=recommendations)
 
-# --- MODIFIED ENDPOINT ---
 @app.post("/classify-waste", response_model=WasteClassificationResponse)
-async def classify_waste(file: UploadFile = File(...)):
-    """Takes an image, gets a caption from Hugging Face, and classifies the waste."""
+async def classify_waste(request: Request, file: UploadFile = File(...)):
+    """Takes an image, gets a caption from Google Gemini, and classifies the waste."""
+    print("Headers:", request.headers)
     try:
         image_bytes = await file.read()
-        caption = get_caption_from_huggingface(image_bytes)
+        caption = await get_caption_from_gemini(image_bytes)
 
-        # The rest of the chain works as before, now using the caption from the API
         category = chain_classify_waste.invoke({"caption": caption}).strip()
         bin_color = chain_bin.invoke({"caption": caption}).strip()
-        explanation = chain_explain.invoke({"caption": caption}).strip()
+        
+        # This call now passes the full context to the improved explanation chain
+        explanation = chain_explain.invoke({
+            "item": caption,
+            "category": category,
+            "bin_color": bin_color
+        }).strip()
+        
         return WasteClassificationResponse(caption=caption, category=category, bin_color=bin_color, explanation=explanation)
+        
     except Exception as e:
-        # This will now also catch errors from the Hugging Face API call
         if isinstance(e, HTTPException):
             raise e
+        print(f"An unexpected error occurred in /classify-waste: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/scan-pest")
