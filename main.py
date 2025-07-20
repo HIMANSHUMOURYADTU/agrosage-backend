@@ -17,6 +17,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 # --- LOAD ENVIRONMENT & CONFIGURE ---
 load_dotenv()
+print("GOOGLE_API_KEY (from .env):", os.getenv("GOOGLE_API_KEY"))
 
 # Google API Key is the only AI-related key needed now
 API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -48,6 +49,9 @@ EMISSION_FACTORS = {
 # ==============================================================================
 print("Initializing Google Gemini AI clients...")
 llm_chat = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=API_KEY)
+
+# CORRECTED: Switched to 'gemini-1.5-flash' to avoid the deprecation error for 'gemini-pro-vision'.
+# This model handles both text and vision tasks.
 llm_vision_pest = genai.GenerativeModel('gemini-1.5-flash')
 
 # --- PROMPT ENGINEERING FIXES ---
@@ -80,6 +84,7 @@ async def get_caption_from_gemini(image_bytes: bytes) -> str:
             "Do not add any extra text, commentary, or options."
         )
         
+        # This will now use the correctly initialized 'gemini-1.5-flash' model
         response = await llm_vision_pest.generate_content_async([prompt, img])
         return response.text.strip()
         
@@ -189,10 +194,18 @@ async def scan_pest(file: UploadFile = File(...)):
     """Analyzes a plant leaf image for pests or diseases."""
     try:
         image = Image.open(io.BytesIO(await file.read())).convert("RGB")
-        prompt = "Analyze this plant leaf. 1. Identify pest/disease. If healthy, say so. 2. Provide a brief, organic solution. Format: 'Diagnosis: [Your Diagnosis].\nSolution: [Your Solution].'"
-        response = llm_vision_pest.generate_content([prompt, image])
-        return {"result": response.text}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+        prompt = (
+            "Analyze this plant leaf. "
+            "1. Identify pest/disease. If healthy, say so. "
+            "2. Provide a brief, organic solution. "
+            "Format: 'Diagnosis: [Your Diagnosis].\\nSolution: [Your Solution].'"
+        )
+        # This will now use the correctly initialized 'gemini-1.5-flash' model
+        response = await llm_vision_pest.generate_content_async([prompt, image])
+        return {"result": response.text.strip()}
+    except Exception as e:
+        print(f"Error in /scan-pest: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/missions")
 def get_missions(): return fake_db["missions"]
